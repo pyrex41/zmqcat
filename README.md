@@ -64,7 +64,7 @@ Default sidecar: `unix:///tmp/zmqcat-<uid>.sock`. Override with `--listen tcp://
 
 ```nix
 {
-  inputs.zmqcat.url = "git+ssh://git@github.com/pyrex41/zmqcat";
+  inputs.zmqcat.url = "github:pyrex41/zmqcat";
 }
 ```
 
