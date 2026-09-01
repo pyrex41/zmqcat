@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/pyrex41/zmqcat"
 	"tailscale.com/types/key"
@@ -28,6 +29,8 @@ Usage:
   zmqcat pub   <topic> [text...]
   zmqcat sub   [topic-prefix]
   zmqcat ping
+  zmqcat ready <service>
+  zmqcat req   <service> [text...]
 
 Local apps (OpenResty, Python, harnesses) talk to --listen.
 Default listen: unix:///tmp/zmqcat-<uid>.sock
@@ -39,10 +42,14 @@ Serve flags:
   --forward PORT    also expose localhost:PORT through the tunnel (repeatable)
   --quiet           hush Tailcat logs
   --local           no Tailcat; same-host bus only
+  --mailbox PATH    durable mailbox state file (default in-memory)
+  --trace           log ZMQC frames (op/id/name)
+  --heartbeat DUR   session liveness interval (default 5s)
 
 Join flags: --listen, --forward, --quiet
 
-Client flags (put/take/pub/sub/ping): --listen, --name
+Client flags (put/take/pub/sub/ping/ready/req): --listen, --name
+  req also: --timeout DUR (default 1s), --retries N (default 3)
 `)
 }
 
@@ -69,6 +76,10 @@ func main() {
 		err = cmdSub(args)
 	case "ping":
 		err = cmdPing(args)
+	case "ready":
+		err = cmdReady(args)
+	case "req":
+		err = cmdReq(args)
 	default:
 		usage()
 		os.Exit(2)
@@ -84,6 +95,9 @@ func cmdServe(args []string) error {
 	name := fs.String("name", hostname(), "node identity")
 	quiet := fs.Bool("quiet", false, "hush Tailcat logs")
 	local := fs.Bool("local", false, "no Tailcat")
+	mailboxPath := fs.String("mailbox", "", "durable mailbox state file")
+	trace := fs.Bool("trace", false, "log ZMQC frames")
+	heartbeat := fs.Duration("heartbeat", 5*time.Second, "session liveness interval")
 	var allow allowList
 	var fwd portList
 	fs.Var(&allow, "allow", "allowed client nodekey (repeatable)")
@@ -98,6 +112,9 @@ func cmdServe(args []string) error {
 		Name:           *name,
 		Quiet:          *quiet,
 		LocalOnly:      *local,
+		MailboxPath:    *mailboxPath,
+		Trace:          *trace,
+		Heartbeat:      *heartbeat,
 		AllowedClients: allow.keys,
 		ForwardPorts:   fwd.ports,
 	})
@@ -242,6 +259,56 @@ func cmdPing(args []string) error {
 	return nil
 }
 
+func cmdReady(args []string) error {
+	fs, listen, name := clientFlags("ready")
+	_ = fs.Parse(args)
+	if fs.NArg() < 1 {
+		return fmt.Errorf("ready: missing service")
+	}
+	c, err := dial(*listen, *name)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	f, err := c.Ready(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	os.Stdout.Write(f.Payload())
+	if len(f.Payload()) == 0 || f.Payload()[len(f.Payload())-1] != '\n' {
+		fmt.Println()
+	}
+	return nil
+}
+
+func cmdReq(args []string) error {
+	fs, listen, name := clientFlags("req")
+	timeout := fs.Duration("timeout", time.Second, "per-attempt wait")
+	retries := fs.Int("retries", 3, "Lazy Pirate attempts")
+	_ = fs.Parse(args)
+	if fs.NArg() < 1 {
+		return fmt.Errorf("req: missing service")
+	}
+	body, err := payload(fs.Args()[1:])
+	if err != nil {
+		return err
+	}
+	c, err := dial(*listen, *name)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	f, err := c.Request(fs.Arg(0), string(body), body, *timeout, *retries)
+	if err != nil {
+		return err
+	}
+	os.Stdout.Write(f.Payload())
+	if len(f.Payload()) == 0 || f.Payload()[len(f.Payload())-1] != '\n' {
+		fmt.Println()
+	}
+	return nil
+}
+
 func clientFlags(name string) (*flag.FlagSet, *string, *string) {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	listen := fs.String("listen", "", "sidecar address")
@@ -288,6 +355,7 @@ type allowList struct {
 }
 
 func (a *allowList) String() string { return "" }
+
 type portList struct {
 	ports []uint16
 }

@@ -26,29 +26,37 @@ var (
 
 // Ops.
 const (
-	OpHello = "hello"
-	OpPut   = "put"
-	OpTake  = "take"
-	OpPub   = "pub"
-	OpSub   = "sub"
-	OpUnsub = "unsub"
-	OpOK    = "ok"
-	OpErr   = "err"
-	OpMsg   = "msg"
-	OpPing  = "ping"
-	OpPong  = "pong"
+	OpHello   = "hello"
+	OpPut     = "put"
+	OpTake    = "take"
+	OpPub     = "pub"
+	OpSub     = "sub"
+	OpUnsub   = "unsub"
+	OpOK      = "ok"
+	OpErr     = "err"
+	OpMsg     = "msg"
+	OpPing    = "ping"
+	OpPong    = "pong"
+	OpReserve = "reserve"
+	OpAck     = "ack"
+	OpNack    = "nack"
+	OpReady   = "ready"
+	OpReq     = "req"
+	OpRep     = "rep"
 )
 
 // Frame is one request or reply.
 type Frame struct {
-	V     int    `json:"v"`
-	Op    string `json:"op"`
-	ID    string `json:"id,omitempty"`
-	Name  string `json:"name,omitempty"`  // mailbox or topic
-	From  string `json:"from,omitempty"`
-	Text  string `json:"text,omitempty"`  // utf-8 convenience
-	Body  []byte `json:"body,omitempty"`  // raw bytes (JSON base64)
-	Error string `json:"error,omitempty"`
+	V        int    `json:"v"`
+	Op       string `json:"op"`
+	ID       string `json:"id,omitempty"`
+	Name     string `json:"name,omitempty"` // mailbox or topic
+	From     string `json:"from,omitempty"`
+	Text     string `json:"text,omitempty"` // utf-8 convenience
+	Body     []byte `json:"body,omitempty"` // raw bytes (JSON base64)
+	Error    string `json:"error,omitempty"`
+	Lease    int64  `json:"lease,omitempty"`
+	Delivery string `json:"delivery,omitempty"`
 }
 
 func (f Frame) Payload() []byte {

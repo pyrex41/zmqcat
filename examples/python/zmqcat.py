@@ -64,10 +64,45 @@ class Client:
         return self._rpc({"op": "sub", "name": prefix, "from": self.name})
 
     def recv(self) -> dict[str, Any]:
-        return self._read()
+        return self._read_skip_ping()
 
     def ping(self) -> dict[str, Any]:
         return self._rpc({"op": "ping"})
+
+    def ready(self, service: str) -> dict[str, Any]:
+        return self._rpc({"op": "ready", "name": service, "from": self.name})
+
+    def req(self, service: str, text: str = "", body: bytes | None = None, timeout: float = 1.0, attempts: int = 3) -> dict[str, Any]:
+        frame = self._payload("req", service, text, body)
+        if "id" not in frame:
+            import time
+
+            frame["id"] = f"r-{time.time_ns()}"
+        last: Exception | None = None
+        for _ in range(max(1, attempts)):
+            try:
+                self.sock.settimeout(timeout)
+                out = self._rpc(frame)
+                self.sock.settimeout(None)
+                return out
+            except Exception as e:
+                last = e
+                self.sock.settimeout(None)
+        raise RuntimeError(f"request abandoned after {attempts} attempts: {last}")
+
+    def rep(self, corr_id: str, text: str = "", name: str = "", body: bytes | None = None) -> dict[str, Any]:
+        f = self._payload("rep", name, text, body)
+        f["id"] = corr_id
+        return self._rpc(f)
+
+    def reserve(self, mailbox: str, lease: int = 60) -> dict[str, Any]:
+        return self._rpc({"op": "reserve", "name": mailbox, "from": self.name, "lease": lease})
+
+    def ack(self, delivery: str) -> dict[str, Any]:
+        return self._rpc({"op": "ack", "delivery": delivery})
+
+    def nack(self, delivery: str) -> dict[str, Any]:
+        return self._rpc({"op": "nack", "delivery": delivery})
 
     def _payload(self, op: str, name: str, text: str, body: bytes | None) -> dict[str, Any]:
         f: dict[str, Any] = {"op": op, "name": name, "from": self.name, "text": text}
@@ -79,10 +114,18 @@ class Client:
 
     def _rpc(self, f: dict[str, Any]) -> dict[str, Any]:
         self._write(f)
-        out = self._read()
+        out = self._read_skip_ping()
         if out.get("op") == "err":
             raise RuntimeError(out.get("error") or "zmqcat error")
         return out
+
+    def _read_skip_ping(self) -> dict[str, Any]:
+        while True:
+            out = self._read()
+            if out.get("op") == "ping":
+                self._write({"op": "pong", "id": out.get("id", "")})
+                continue
+            return out
 
     def _write(self, f: dict[str, Any]) -> None:
         raw = json.dumps(f).encode()
@@ -125,5 +168,9 @@ if __name__ == "__main__":
         c.sub(sys.argv[2] if len(sys.argv) > 2 else "")
         while True:
             print(c.recv())
+    elif op == "ready":
+        print(c.ready(sys.argv[2]))
+    elif op == "req":
+        print(c.req(sys.argv[2], " ".join(sys.argv[3:])))
     else:
-        raise SystemExit("put|take|pub|sub")
+        raise SystemExit("put|take|pub|sub|ready|req")

@@ -22,6 +22,44 @@ func TestPutTake(t *testing.T) {
 	}
 }
 
+func TestPersistentReserveAckRedelivery(t *testing.T) {
+	p := t.TempDir() + "/mail.json"
+	b, err := OpenPersistent(p, 10, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.Put("in", Msg{Body: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	d, err := b.Reserve(context.Background(), "in", time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.ID == "" {
+		t.Fatal("missing delivery id")
+	}
+	time.Sleep(3 * time.Millisecond)
+	d2, err := b.Reserve(context.Background(), "in", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(d2.Msg.Body) != "x" {
+		t.Fatal("not redelivered")
+	}
+	if err := b.Ack(d2.ID); err != nil {
+		t.Fatal(err)
+	}
+	b2, err := OpenPersistent(p, 10, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b2.Close()
+	if _, err := b2.Reserve(context.Background(), "in", time.Second); err == nil {
+		t.Fatal("acked message persisted")
+	}
+}
+
 func TestTakeBlocks(t *testing.T) {
 	b := New()
 	defer b.Close()
@@ -69,19 +107,114 @@ func TestTakeCancel(t *testing.T) {
 	}
 }
 
-func TestOverflowDropsOldest(t *testing.T) {
+func TestOverflowRejects(t *testing.T) {
 	b := NewWithLimits(2, 1024)
 	defer b.Close()
-	_ = b.Put("q", Msg{Body: []byte("1")})
-	_ = b.Put("q", Msg{Body: []byte("2")})
+	if err := b.Put("q", Msg{Body: []byte("1")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Put("q", Msg{Body: []byte("2")}); err != nil {
+		t.Fatal(err)
+	}
 	err := b.Put("q", Msg{Body: []byte("3")})
 	if !errors.Is(err, ErrDropped) {
 		t.Fatalf("got %v", err)
 	}
-	a, _ := b.TryTake("q")
-	c, _ := b.TryTake("q")
-	if string(a.Body)+string(c.Body) != "23" {
-		t.Fatalf("got %s%s", a.Body, c.Body)
+	a, err := b.TryTake("q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := b.TryTake("q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(a.Body)+string(c.Body) != "12" {
+		t.Fatalf("dropped oldest: got %s%s", a.Body, c.Body)
+	}
+	if _, err := b.TryTake("q"); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("third message was queued: %v", err)
+	}
+}
+
+func TestLeaseExpireRequeue(t *testing.T) {
+	b := New()
+	defer b.Close()
+	if err := b.Put("q", Msg{Body: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Reserve(context.Background(), "q", time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.TryTake("q"); !errors.Is(err, ErrEmpty) {
+		t.Fatal("reserved message still queued")
+	}
+	time.Sleep(3 * time.Millisecond)
+	b.ExpireLeases()
+	msg, err := b.TryTake("q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(msg.Body) != "x" {
+		t.Fatalf("got %q", msg.Body)
+	}
+}
+
+func TestNackRequeue(t *testing.T) {
+	b := New()
+	defer b.Close()
+	if err := b.Put("q", Msg{Body: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	d, err := b.Reserve(context.Background(), "q", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Nack(d.ID); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := b.TryTake("q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(msg.Body) != "x" {
+		t.Fatalf("got %q", msg.Body)
+	}
+}
+
+func TestLastValueCacheReplay(t *testing.T) {
+	b := New()
+	defer b.Close()
+	if err := b.Pub("events.foo", Msg{Body: []byte("a")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Pub("events.bar", Msg{Body: []byte("b")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Pub("other", Msg{Body: []byte("no")}); err != nil {
+		t.Fatal(err)
+	}
+	ch, cancel, err := b.Sub("events.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	got := map[string]string{}
+	deadline := time.After(time.Second)
+	for len(got) < 2 {
+		select {
+		case msg := <-ch:
+			got[msg.Name] = string(msg.Body)
+		case <-deadline:
+			t.Fatalf("lvc replay missing: %v", got)
+		}
+	}
+	if got["events.foo"] != "a" || got["events.bar"] != "b" {
+		t.Fatalf("got %v", got)
+	}
+	select {
+	case msg := <-ch:
+		t.Fatalf("unexpected %q %q", msg.Name, msg.Body)
+	case <-time.After(30 * time.Millisecond):
 	}
 }
 
@@ -130,5 +263,19 @@ func TestCloseUnblocks(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("not unblocked")
+	}
+}
+
+func TestPutDuplicateID(t *testing.T) {
+	b := New()
+	defer b.Close()
+	if err := b.Put("q", Msg{ID: "same", Body: []byte("1")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Put("q", Msg{ID: "same", Body: []byte("2")}); err != nil {
+		t.Fatal(err)
+	}
+	if b.Depth("q") != 1 {
+		t.Fatalf("depth %d", b.Depth("q"))
 	}
 }
