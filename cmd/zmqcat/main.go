@@ -102,7 +102,7 @@ func cmdServe(args []string) error {
 	var fwd portList
 	fs.Var(&allow, "allow", "allowed client nodekey (repeatable)")
 	fs.Var(&fwd, "forward", "localhost TCP port to expose (repeatable)")
-	_ = fs.Parse(args)
+	_ = parseArgs(fs, args)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -137,7 +137,7 @@ func cmdJoin(args []string) error {
 	quiet := fs.Bool("quiet", false, "hush Tailcat logs")
 	var fwd portList
 	fs.Var(&fwd, "forward", "listen locally and dial this port on the server")
-	_ = fs.Parse(args)
+	_ = parseArgs(fs, args)
 	if fs.NArg() < 1 {
 		return fmt.Errorf("join: missing token")
 	}
@@ -159,7 +159,7 @@ func cmdJoin(args []string) error {
 
 func cmdPut(args []string) error {
 	fs, listen, name := clientFlags("put")
-	_ = fs.Parse(args)
+	_ = parseArgs(fs, args)
 	if fs.NArg() < 1 {
 		return fmt.Errorf("put: missing mailbox")
 	}
@@ -177,7 +177,7 @@ func cmdPut(args []string) error {
 
 func cmdTake(args []string) error {
 	fs, listen, name := clientFlags("take")
-	_ = fs.Parse(args)
+	_ = parseArgs(fs, args)
 	if fs.NArg() < 1 {
 		return fmt.Errorf("take: missing mailbox")
 	}
@@ -199,7 +199,7 @@ func cmdTake(args []string) error {
 
 func cmdPub(args []string) error {
 	fs, listen, name := clientFlags("pub")
-	_ = fs.Parse(args)
+	_ = parseArgs(fs, args)
 	if fs.NArg() < 1 {
 		return fmt.Errorf("pub: missing topic")
 	}
@@ -217,7 +217,7 @@ func cmdPub(args []string) error {
 
 func cmdSub(args []string) error {
 	fs, listen, name := clientFlags("sub")
-	_ = fs.Parse(args)
+	_ = parseArgs(fs, args)
 	prefix := ""
 	if fs.NArg() > 0 {
 		prefix = fs.Arg(0)
@@ -246,7 +246,7 @@ func cmdSub(args []string) error {
 
 func cmdPing(args []string) error {
 	fs, listen, name := clientFlags("ping")
-	_ = fs.Parse(args)
+	_ = parseArgs(fs, args)
 	c, err := dial(*listen, *name)
 	if err != nil {
 		return err
@@ -261,7 +261,7 @@ func cmdPing(args []string) error {
 
 func cmdReady(args []string) error {
 	fs, listen, name := clientFlags("ready")
-	_ = fs.Parse(args)
+	_ = parseArgs(fs, args)
 	if fs.NArg() < 1 {
 		return fmt.Errorf("ready: missing service")
 	}
@@ -285,7 +285,7 @@ func cmdReq(args []string) error {
 	fs, listen, name := clientFlags("req")
 	timeout := fs.Duration("timeout", time.Second, "per-attempt wait")
 	retries := fs.Int("retries", 3, "Lazy Pirate attempts")
-	_ = fs.Parse(args)
+	_ = parseArgs(fs, args)
 	if fs.NArg() < 1 {
 		return fmt.Errorf("req: missing service")
 	}

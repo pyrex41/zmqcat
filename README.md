@@ -60,6 +60,40 @@ zmqcat req echo '{"hello":true}'
 
 Default sidecar: `unix:///tmp/zmqcat-<uid>.sock`. Override with `--listen tcp://127.0.0.1:5555` or `ZMQCAT_LISTEN`.
 
+## Install with Nix
+
+```nix
+{
+  inputs.zmqcat.url = "git+ssh://git@github.com/pyrex41/zmqcat";
+}
+```
+
+`nixosModules.default` and `darwinModules.default` give you
+`services.zmqcat`, which runs either role:
+
+```nix
+# the host that owns the bus
+services.zmqcat = {
+  enable = true;
+  role = "serve";
+  mailbox = "/var/lib/zmqcat/mailbox.json";  # jobs survive a restart
+  allow = [ "nodekey:…" ];                   # else the token alone is enough
+};
+
+# every other host
+services.zmqcat = {
+  enable = true;
+  role = "join";
+  tokenFile = "/run/secrets/zmqcat-join-token";  # the tc… token, from a file
+};
+```
+
+`tokenFile` is a path, never a literal: a string in your Nix config lands in
+the world-readable store.
+
+If you are running this under huginn, its `INSTALL.md` covers both sides in
+order — one flake input pulls in this repo and re-exports these modules.
+
 ## Patterns
 
 | ZMQ Guide | zmqcat |
