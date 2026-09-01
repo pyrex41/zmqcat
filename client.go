@@ -1,23 +1,36 @@
 package zmqcat
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pyrex41/zmqcat/internal/wire"
 )
 
-// ErrAbandoned is returned by Request after retries are exhausted.
-var ErrAbandoned = errors.New("zmqcat: request abandoned")
+var (
+	// ErrAbandoned is returned by Request after retries are exhausted.
+	ErrAbandoned = errors.New("zmqcat: request abandoned")
+	// ErrDesync means a read was interrupted part way through a frame, so the
+	// remaining bytes of that frame are still queued. The session cannot be
+	// resynchronized; redial instead.
+	ErrDesync = errors.New("zmqcat: session desynchronized, redial required")
+)
 
 // Client is a single session on a hub (local unix/tcp or a spliced tunnel).
 type Client struct {
 	Conn net.Conn
 	Name string
-	seq  uint64
+
+	seq      uint64
+	prefixed sync.Once
+	prefix   string
+	desync   atomic.Bool
 }
 
 // Dial opens a session to a local sidecar listen address.
@@ -157,6 +170,11 @@ func (c *Client) Request(name, text string, body []byte, timeout time.Duration, 
 		} else {
 			last = fmt.Errorf("req %s: %s", name, f.Error)
 		}
+		// Retrying on a desynchronized socket only produces garbage. The hub
+		// keeps the request pending, so redial and Request with a fresh client.
+		if errors.Is(last, ErrDesync) {
+			return wire.Frame{}, fmt.Errorf("%w after %d attempts: %w", ErrAbandoned, i+1, last)
+		}
 	}
 	return wire.Frame{}, fmt.Errorf("%w after %d attempts: %v", ErrAbandoned, attempts, last)
 }
@@ -198,8 +216,19 @@ func (c *Client) Ping() error {
 	return nil
 }
 
+// nextID is unique across clients and processes. Correlation ids double as
+// mailbox message ids for idempotent retries, so a per-client counter alone
+// would let two clients collide and have one another's messages deduplicated.
 func (c *Client) nextID() string {
-	return fmt.Sprintf("r-%d", atomic.AddUint64(&c.seq, 1))
+	c.prefixed.Do(func() {
+		var x [8]byte
+		if _, err := rand.Read(x[:]); err != nil {
+			c.prefix = fmt.Sprintf("%d", time.Now().UnixNano())
+			return
+		}
+		c.prefix = hex.EncodeToString(x[:])
+	})
+	return fmt.Sprintf("%s-%d", c.prefix, atomic.AddUint64(&c.seq, 1))
 }
 
 func (c *Client) roundTrip(req wire.Frame) (wire.Frame, error) {
@@ -207,6 +236,9 @@ func (c *Client) roundTrip(req wire.Frame) (wire.Frame, error) {
 }
 
 func (c *Client) roundTripTimeout(req wire.Frame, timeout time.Duration) (wire.Frame, error) {
+	if c.desync.Load() {
+		return wire.Frame{}, ErrDesync
+	}
 	if req.ID == "" {
 		req.ID = c.nextID()
 	}
@@ -222,8 +254,14 @@ func (c *Client) roundTripTimeout(req wire.Frame, timeout time.Duration) (wire.F
 
 func (c *Client) readSkipPing() (wire.Frame, error) {
 	for {
-		f, err := wire.Read(c.Conn)
+		f, n, err := wire.ReadCounted(c.Conn)
 		if err != nil {
+			// A read that stopped part way through a frame leaves the rest of
+			// that frame on the wire; nothing after it can be parsed.
+			if n > 0 {
+				c.desync.Store(true)
+				err = fmt.Errorf("%w: %v", ErrDesync, err)
+			}
 			return f, err
 		}
 		if f.Op == wire.OpPing {

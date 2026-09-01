@@ -4,6 +4,7 @@ package hub
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -22,6 +23,9 @@ type TraceFunc func(session, dir string, f wire.Frame)
 const (
 	DefaultHeartbeat = 5 * time.Second
 	DefaultLiveness  = 3
+	// DefaultPendingTTL bounds an unanswered req's slot in the pending table
+	// so a long-lived client cannot accumulate them without limit.
+	DefaultPendingTTL = 10 * time.Minute
 )
 
 // Hub owns the bus and sessions.
@@ -32,9 +36,21 @@ type Hub struct {
 	Heartbeat time.Duration
 	Liveness  int
 
+	// PendingTTL bounds how long an unanswered req occupies the pending
+	// table. Zero uses DefaultPendingTTL.
+	PendingTTL time.Duration
+
 	mu       sync.Mutex
+	sids     uint64
 	sessions map[*session]struct{}
-	pending  map[string]*session // req correlation id -> waiting client
+	pending  map[string]pendingReq // scoped req key -> waiting client
+}
+
+// pendingReq is one in-flight req awaiting a worker rep.
+type pendingReq struct {
+	s        *session
+	clientID string // the id the requester used, echoed back on the rep
+	expires  time.Time
 }
 
 func New(bus *mailbox.Bus) *Hub {
@@ -47,7 +63,7 @@ func New(bus *mailbox.Bus) *Hub {
 		Heartbeat: DefaultHeartbeat,
 		Liveness:  DefaultLiveness,
 		sessions:  make(map[*session]struct{}),
-		pending:   make(map[string]*session),
+		pending:   make(map[string]pendingReq),
 	}
 }
 
@@ -75,7 +91,7 @@ func (h *Hub) clearPending(s *session) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for id, wait := range h.pending {
-		if wait == s {
+		if wait.s == s {
 			delete(h.pending, id)
 		}
 	}
@@ -85,6 +101,8 @@ func (h *Hub) clearPending(s *session) {
 func (h *Hub) ServeConn(ctx context.Context, c net.Conn) {
 	s := &session{h: h, c: c, name: c.RemoteAddr().String(), lastSeen: time.Now()}
 	h.mu.Lock()
+	h.sids++
+	s.sid = h.sids
 	h.sessions[s] = struct{}{}
 	h.mu.Unlock()
 	defer func() {
@@ -100,11 +118,13 @@ type session struct {
 	h    *Hub
 	c    net.Conn
 	name string
+	sid  uint64
 
 	mu       sync.Mutex
 	closed   bool
 	unsub    []func()
 	inflight []string
+	repAck   map[string]string // delivered message id -> delivery id
 	lastSeen time.Time
 }
 
@@ -166,6 +186,33 @@ func (s *session) claimInflight(id string) bool {
 	}
 	s.inflight = out
 	return true
+}
+
+// trackRepAck remembers which delivery a rep for msgID should acknowledge.
+func (s *session) trackRepAck(msgID, delivery string) {
+	if msgID == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.repAck == nil {
+		s.repAck = make(map[string]string)
+	}
+	s.repAck[msgID] = delivery
+	s.mu.Unlock()
+}
+
+func (s *session) takeRepAck(msgID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d := s.repAck[msgID]
+	delete(s.repAck, msgID)
+	return d
+}
+
+func (s *session) dropRepAck(msgID string) {
+	s.mu.Lock()
+	delete(s.repAck, msgID)
+	s.mu.Unlock()
 }
 
 func (s *session) trackInflight(id string) {
@@ -263,27 +310,27 @@ func (s *session) handle(ctx context.Context, f wire.Frame) error {
 	case wire.OpPong:
 		return nil
 	case wire.OpPut:
-		msg := mailbox.Msg{ID: f.ID, From: s.from(f), Body: f.Payload()}
+		// Correlation ids double as mailbox message ids for idempotent
+		// retries, so they must be scoped to the sender: two clients that
+		// happen to pick the same id must not deduplicate each other.
+		msg := mailbox.Msg{ID: s.scopedID(f.ID), From: s.from(f), Body: f.Payload()}
 		if err := s.h.Bus.Put(f.Name, msg); err != nil {
 			return err
 		}
 		return s.reply(wire.Frame{Op: wire.OpOK, ID: f.ID, Name: f.Name})
 	case wire.OpTake:
-		go s.takeJob(ctx, f)
+		// take is the historical fire-and-forget pop: the lease exists only
+		// so a failed write requeues.
+		go s.takeJob(ctx, f, false)
 		return nil
 	case wire.OpReady:
-		go s.takeJob(ctx, f)
+		// A competing consumer keeps the lease until it reps, acks, or dies,
+		// so a worker that dies holding a job gives it back.
+		go s.takeJob(ctx, f, true)
 		return nil
 	case wire.OpReserve:
-		d, err := s.h.Bus.Reserve(ctx, f.Name, time.Duration(f.Lease)*time.Second)
-		if err != nil {
-			return err
-		}
-		s.trackInflight(d.ID)
-		out := msgFrame(f.ID, d.Msg)
-		out.Delivery = d.ID
-		out.Lease = d.Expires.Unix()
-		return s.reply(out)
+		go s.reserveJob(ctx, f)
+		return nil
 	case wire.OpAck:
 		if err := s.h.Bus.Ack(f.Delivery); err != nil {
 			return err
@@ -300,39 +347,49 @@ func (s *session) handle(ctx context.Context, f wire.Frame) error {
 		if f.ID == "" {
 			return errors.New("req: missing correlation id")
 		}
+		key := s.scopedID(f.ID)
+		now := time.Now()
 		s.h.mu.Lock()
-		if _, exists := s.h.pending[f.ID]; exists {
-			s.h.mu.Unlock()
-			return nil
-		}
-		s.h.pending[f.ID] = s
+		s.h.expirePendingLocked(now)
+		s.h.pending[key] = pendingReq{s: s, clientID: f.ID, expires: now.Add(s.h.pendingTTL())}
 		s.h.mu.Unlock()
-		msg := mailbox.Msg{ID: f.ID, From: s.from(f), Body: f.Payload()}
+		// A retry re-enqueues rather than being dropped: Bus.Put deduplicates
+		// while the job is still queued or leased, so this is a no-op for a
+		// merely slow worker but recovers the request if the worker that held
+		// it died. Without it a Lazy Pirate retry could never make progress.
+		msg := mailbox.Msg{ID: key, From: s.from(f), Body: f.Payload()}
 		if err := s.h.Bus.Put(f.Name, msg); err != nil {
 			s.h.mu.Lock()
-			delete(s.h.pending, f.ID)
+			if p, ok := s.h.pending[key]; ok && p.s == s {
+				delete(s.h.pending, key)
+			}
 			s.h.mu.Unlock()
 			return err
 		}
 		return nil
 	case wire.OpRep:
+		if d := s.takeRepAck(f.ID); d != "" {
+			if s.claimInflight(d) {
+				_ = s.h.Bus.Ack(d)
+			}
+		}
 		s.h.mu.Lock()
-		dest := s.h.pending[f.ID]
+		dest, found := s.h.pending[f.ID]
 		delete(s.h.pending, f.ID)
 		s.h.mu.Unlock()
 		if err := s.reply(wire.Frame{Op: wire.OpOK, ID: f.ID}); err != nil {
 			return err
 		}
-		if dest != nil {
+		if found && dest.s != nil {
 			out := wire.Frame{
 				Op:   wire.OpRep,
-				ID:   f.ID,
+				ID:   dest.clientID,
 				Name: f.Name,
 				From: s.from(f),
 				Body: f.Body,
 				Text: f.Text,
 			}
-			_ = dest.reply(out)
+			_ = dest.s.reply(out)
 		}
 		return nil
 	case wire.OpPub:
@@ -368,7 +425,10 @@ func (s *session) handle(ctx context.Context, f wire.Frame) error {
 	}
 }
 
-func (s *session) takeJob(ctx context.Context, f wire.Frame) {
+// takeJob pops one job and writes it to this session. When hold is set the
+// delivery stays leased until the worker reps, acks, nacks, or disconnects;
+// otherwise it is acknowledged as soon as the frame is on the wire.
+func (s *session) takeJob(ctx context.Context, f wire.Frame, hold bool) {
 	msg, err := s.h.Bus.Take(ctx, f.Name)
 	if err != nil {
 		s.reply(wire.Frame{Op: wire.OpErr, ID: f.ID, Error: err.Error()})
@@ -385,14 +445,67 @@ func (s *session) takeJob(ctx context.Context, f wire.Frame) {
 	if out.ID == "" {
 		out.ID = f.ID
 	}
+	if hold {
+		out.Delivery = d.ID
+		out.Lease = d.Expires.Unix()
+		s.trackRepAck(out.ID, d.ID)
+	}
 	if err := s.reply(out); err != nil {
+		s.dropRepAck(out.ID)
 		if s.claimInflight(d.ID) {
 			_ = s.h.Bus.Nack(d.ID)
 		}
 		return
 	}
+	if hold {
+		return
+	}
 	if s.claimInflight(d.ID) {
 		_ = s.h.Bus.Ack(d.ID)
+	}
+}
+
+// scopedID namespaces a client-chosen correlation id by session so ids from
+// different clients cannot collide in the mailbox or the pending table. An
+// empty id stays empty: the bus then generates a unique one and no
+// deduplication applies.
+func (s *session) scopedID(id string) string {
+	if id == "" {
+		return ""
+	}
+	return fmt.Sprintf("s%d:%s", s.sid, id)
+}
+
+func (h *Hub) pendingTTL() time.Duration {
+	if h.PendingTTL > 0 {
+		return h.PendingTTL
+	}
+	return DefaultPendingTTL
+}
+
+// expirePendingLocked drops req slots nobody ever answered.
+func (h *Hub) expirePendingLocked(now time.Time) {
+	for id, p := range h.pending {
+		if !p.expires.IsZero() && now.After(p.expires) {
+			delete(h.pending, id)
+		}
+	}
+}
+
+func (s *session) reserveJob(ctx context.Context, f wire.Frame) {
+	d, err := s.h.Bus.Reserve(ctx, f.Name, time.Duration(f.Lease)*time.Second)
+	if err != nil {
+		s.reply(wire.Frame{Op: wire.OpErr, ID: f.ID, Error: err.Error()})
+		return
+	}
+	s.trackInflight(d.ID)
+	out := msgFrame(f.ID, d.Msg)
+	out.Delivery = d.ID
+	out.Lease = d.Expires.Unix()
+	if err := s.reply(out); err != nil {
+		if s.claimInflight(d.ID) {
+			_ = s.h.Bus.Nack(d.ID)
+		}
 	}
 }
 

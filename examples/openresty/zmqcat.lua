@@ -92,7 +92,11 @@ function _M.connect(listen, name)
   if not ok then
     return nil, err
   end
-  local self = setmetatable({ sock = sock, name = name or "openresty" }, mt)
+  -- Correlation ids double as mailbox message ids, so they must be unique
+  -- across clients: a per-connection counter alone would let two workers
+  -- deduplicate each other's requests.
+  local prefix = string.format("%08x%08x", math.random(0, 0xffffffff), ngx.now() * 1000 % 0xffffffff)
+  local self = setmetatable({ sock = sock, name = name or "openresty", prefix = prefix, seq = 0 }, mt)
   local f, herr = self:hello(self.name)
   if not f then
     sock:close()
@@ -129,8 +133,14 @@ function _M:ready(service)
   return self:rpc({ op = "ready", name = service, from = self.name })
 end
 
-function _M:req(service, text)
-  return self:rpc({ op = "req", name = service, from = self.name, text = text or "" })
+function _M:next_id()
+  self.seq = self.seq + 1
+  return self.prefix .. "-" .. self.seq
+end
+
+-- req requires a correlation id; the hub rejects the frame without one.
+function _M:req(service, text, id)
+  return self:rpc({ op = "req", name = service, from = self.name, text = text or "", id = id or self:next_id() })
 end
 
 function _M:rep(id, text, name)

@@ -90,28 +90,42 @@ func Write(w io.Writer, f Frame) error {
 	return err
 }
 
+// Read decodes one frame.
 func Read(r io.Reader) (Frame, error) {
+	f, _, err := ReadCounted(r)
+	return f, err
+}
+
+// ReadCounted decodes one frame and also reports how many bytes it consumed.
+// A caller whose read was interrupted (for example by a deadline) uses the
+// count to tell a clean frame boundary from a desynchronized stream: zero
+// bytes consumed means the next Read can still resynchronize, anything else
+// means the remainder of a partial frame is still queued on the wire.
+func ReadCounted(r io.Reader) (Frame, int, error) {
 	var hdr [8]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return Frame{}, err
+	read, err := io.ReadFull(r, hdr[:])
+	if err != nil {
+		return Frame{}, read, err
 	}
 	if string(hdr[:4]) != Magic {
-		return Frame{}, fmt.Errorf("%w: %q", ErrMagic, hdr[:4])
+		return Frame{}, read, fmt.Errorf("%w: %q", ErrMagic, hdr[:4])
 	}
 	n := binary.BigEndian.Uint32(hdr[4:])
 	if n == 0 || n > MaxBody {
-		return Frame{}, ErrTooBig
+		return Frame{}, read, ErrTooBig
 	}
 	raw := make([]byte, n)
-	if _, err := io.ReadFull(r, raw); err != nil {
-		return Frame{}, err
+	got, err := io.ReadFull(r, raw)
+	read += got
+	if err != nil {
+		return Frame{}, read, err
 	}
 	var f Frame
 	if err := json.Unmarshal(raw, &f); err != nil {
-		return Frame{}, err
+		return Frame{}, read, err
 	}
 	if f.V != 0 && f.V != Version {
-		return Frame{}, fmt.Errorf("%w: %d", ErrVersion, f.V)
+		return Frame{}, read, fmt.Errorf("%w: %d", ErrVersion, f.V)
 	}
-	return f, nil
+	return f, read, nil
 }

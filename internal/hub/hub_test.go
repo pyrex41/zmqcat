@@ -370,3 +370,167 @@ func mustReadRaw(t *testing.T, r io.Reader) wire.Frame {
 	}
 	return f
 }
+
+// Two clients that independently pick the same correlation id must not
+// deduplicate each other's jobs.
+func TestPutIDsAreScopedPerSession(t *testing.T) {
+	h := testHub(t)
+	a, aS := net.Pipe()
+	b, bS := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	go h.ServeConn(context.Background(), aS)
+	go h.ServeConn(context.Background(), bS)
+
+	mustWrite(t, a, wire.Frame{Op: wire.OpPut, ID: "r-2", Name: "jobs", Text: "from-a"})
+	if got := mustRead(t, a); got.Op != wire.OpOK {
+		t.Fatalf("put a: %+v", got)
+	}
+	mustWrite(t, b, wire.Frame{Op: wire.OpPut, ID: "r-2", Name: "jobs", Text: "from-b"})
+	if got := mustRead(t, b); got.Op != wire.OpOK {
+		t.Fatalf("put b: %+v", got)
+	}
+
+	r, rS := net.Pipe()
+	defer r.Close()
+	go h.ServeConn(context.Background(), rS)
+	seen := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		mustWrite(t, r, wire.Frame{Op: wire.OpTake, Name: "jobs"})
+		msg := mustRead(t, r)
+		if msg.Op != wire.OpMsg {
+			t.Fatalf("take %d: %+v", i, msg)
+		}
+		seen[string(msg.Payload())] = true
+	}
+	if !seen["from-a"] || !seen["from-b"] {
+		t.Fatalf("a job was swallowed as a duplicate: %v", seen)
+	}
+}
+
+// A retried req must re-enqueue when the worker holding it died, otherwise
+// the Lazy Pirate loop can never make progress.
+func TestReqRetryRecoversFromDeadWorker(t *testing.T) {
+	h := testHub(t)
+	c, cS := net.Pipe()
+	defer c.Close()
+	go h.ServeConn(context.Background(), cS)
+
+	w1, w1S := net.Pipe()
+	go h.ServeConn(context.Background(), w1S)
+	mustWrite(t, w1, wire.Frame{Op: wire.OpReady, Name: "echo"})
+	mustWrite(t, c, wire.Frame{Op: wire.OpReq, ID: "c1", Name: "echo", Text: "hi"})
+	if job := mustRead(t, w1); job.Op != wire.OpMsg {
+		t.Fatalf("worker1 job: %+v", job)
+	}
+	w1.Close() // worker dies holding the request, never replies
+
+	// The client retries with the same correlation id.
+	mustWrite(t, c, wire.Frame{Op: wire.OpReq, ID: "c1", Name: "echo", Text: "hi"})
+
+	w2, w2S := net.Pipe()
+	defer w2.Close()
+	go h.ServeConn(context.Background(), w2S)
+	mustWrite(t, w2, wire.Frame{Op: wire.OpReady, Name: "echo"})
+	job := mustRead(t, w2)
+	if job.Op != wire.OpMsg || string(job.Payload()) != "hi" {
+		t.Fatalf("retry did not re-enqueue: %+v", job)
+	}
+	mustWrite(t, w2, wire.Frame{Op: wire.OpRep, ID: job.ID, Name: "echo", Text: "there"})
+	if got := mustRead(t, w2); got.Op != wire.OpOK {
+		t.Fatalf("rep ack: %+v", got)
+	}
+	rep := mustRead(t, c)
+	if rep.Op != wire.OpRep || string(rep.Payload()) != "there" || rep.ID != "c1" {
+		t.Fatalf("rep %+v", rep)
+	}
+}
+
+// A retry while the worker is merely slow must not duplicate the job.
+func TestReqRetryDoesNotDuplicate(t *testing.T) {
+	h := testHub(t)
+	c, cS := net.Pipe()
+	defer c.Close()
+	go h.ServeConn(context.Background(), cS)
+
+	mustWrite(t, c, wire.Frame{Op: wire.OpReq, ID: "c1", Name: "echo", Text: "hi"})
+	mustWrite(t, c, wire.Frame{Op: wire.OpReq, ID: "c1", Name: "echo", Text: "hi"})
+	time.Sleep(50 * time.Millisecond)
+	if got := h.Bus.Depth("echo"); got != 1 {
+		t.Fatalf("retry duplicated the job: depth %d", got)
+	}
+}
+
+func TestPendingExpires(t *testing.T) {
+	h := testHub(t)
+	h.PendingTTL = 10 * time.Millisecond
+	c, cS := net.Pipe()
+	defer c.Close()
+	go h.ServeConn(context.Background(), cS)
+
+	mustWrite(t, c, wire.Frame{Op: wire.OpReq, ID: "old", Name: "svc", Text: "x"})
+	time.Sleep(30 * time.Millisecond)
+	mustWrite(t, c, wire.Frame{Op: wire.OpReq, ID: "new", Name: "svc", Text: "y"})
+	time.Sleep(30 * time.Millisecond)
+	h.mu.Lock()
+	n := len(h.pending)
+	h.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("pending entries %d, want the expired one dropped", n)
+	}
+}
+
+// A competing consumer that dies without replying must give the job back.
+func TestReadyWorkerDeathRequeues(t *testing.T) {
+	h := testHub(t)
+	c, cS := net.Pipe()
+	defer c.Close()
+	go h.ServeConn(context.Background(), cS)
+	mustWrite(t, c, wire.Frame{Op: wire.OpPut, Name: "svc", Text: "work"})
+	if got := mustRead(t, c); got.Op != wire.OpOK {
+		t.Fatalf("put: %+v", got)
+	}
+
+	w1, w1S := net.Pipe()
+	go h.ServeConn(context.Background(), w1S)
+	mustWrite(t, w1, wire.Frame{Op: wire.OpReady, Name: "svc"})
+	job := mustRead(t, w1)
+	if job.Op != wire.OpMsg || job.Delivery == "" {
+		t.Fatalf("ready delivery must be leased: %+v", job)
+	}
+	w1.Close()
+
+	w2, w2S := net.Pipe()
+	defer w2.Close()
+	go h.ServeConn(context.Background(), w2S)
+	mustWrite(t, w2, wire.Frame{Op: wire.OpReady, Name: "svc"})
+	again := mustRead(t, w2)
+	if again.Op != wire.OpMsg || string(again.Payload()) != "work" {
+		t.Fatalf("job not requeued after worker death: %+v", again)
+	}
+}
+
+// rep acknowledges the delivery, so the job is not redelivered afterwards.
+func TestRepAcknowledgesDelivery(t *testing.T) {
+	h := testHub(t)
+	c, cS := net.Pipe()
+	defer c.Close()
+	go h.ServeConn(context.Background(), cS)
+	w, wS := net.Pipe()
+	defer w.Close()
+	go h.ServeConn(context.Background(), wS)
+
+	mustWrite(t, w, wire.Frame{Op: wire.OpReady, Name: "echo"})
+	mustWrite(t, c, wire.Frame{Op: wire.OpReq, ID: "c1", Name: "echo", Text: "hi"})
+	job := mustRead(t, w)
+	mustWrite(t, w, wire.Frame{Op: wire.OpRep, ID: job.ID, Name: "echo", Text: "there"})
+	if got := mustRead(t, w); got.Op != wire.OpOK {
+		t.Fatalf("rep ack: %+v", got)
+	}
+	if rep := mustRead(t, c); rep.ID != "c1" {
+		t.Fatalf("rep %+v", rep)
+	}
+	if n := h.Bus.Inflight(); n != 0 {
+		t.Fatalf("delivery still leased after rep: %d", n)
+	}
+}

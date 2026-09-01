@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -21,6 +22,10 @@ var (
 	ErrDropped  = errors.New("mailbox: queue full")
 	ErrNotFound = errors.New("mailbox: delivery not found")
 )
+
+// MaxCachedTopics bounds the last-value cache so a stream of one-shot topic
+// names cannot grow it without limit.
+const MaxCachedTopics = 4096
 
 const (
 	DefaultMaxQueue = 1024
@@ -53,6 +58,7 @@ type Bus struct {
 	boxes    map[string]*box
 	subs     []sub
 	last     map[string]Msg // last-value cache per pub topic
+	dedup    map[string]int // name\x00msgID -> copies queued or leased
 	path     string
 	inflight map[string]Delivery
 	stop     chan struct{}
@@ -90,6 +96,7 @@ func NewWithLimits(maxQueue, maxBody int) *Bus {
 		maxBody:  maxBody,
 		boxes:    make(map[string]*box),
 		last:     make(map[string]Msg),
+		dedup:    make(map[string]int),
 		inflight: make(map[string]Delivery),
 		stop:     make(chan struct{}),
 	}
@@ -106,6 +113,7 @@ func OpenPersistent(path string, maxQueue, maxBody int) (*Bus, error) {
 		return b, nil
 	}
 	if err != nil {
+		b.Close()
 		return nil, err
 	}
 	var st struct {
@@ -113,13 +121,18 @@ func OpenPersistent(path string, maxQueue, maxBody int) (*Bus, error) {
 		Inflight map[string]Delivery `json:"inflight"`
 	}
 	if err = json.Unmarshal(raw, &st); err != nil {
+		b.Close()
 		return nil, err
 	}
 	for n, q := range st.Boxes {
 		b.boxes[n] = &box{q: q}
+		for _, m := range q {
+			b.indexAddLocked(m)
+		}
 	}
 	for id, d := range st.Inflight {
 		b.inflight[id] = d
+		b.indexAddLocked(d.Msg)
 	}
 	return b, nil
 }
@@ -142,10 +155,35 @@ func (b *Bus) persistLocked() error {
 		return e
 	}
 	t := b.path + ".tmp"
-	if e = os.WriteFile(t, raw, 0600); e != nil {
+	f, e := os.OpenFile(t, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if e != nil {
 		return e
 	}
-	return os.Rename(t, b.path)
+	if _, e = f.Write(raw); e != nil {
+		f.Close()
+		os.Remove(t)
+		return e
+	}
+	// Without the fsync the rename can land before the contents do, so a
+	// crash could resurrect acknowledged messages or truncate the queue.
+	if e = f.Sync(); e != nil {
+		f.Close()
+		os.Remove(t)
+		return e
+	}
+	if e = f.Close(); e != nil {
+		os.Remove(t)
+		return e
+	}
+	if e = os.Rename(t, b.path); e != nil {
+		os.Remove(t)
+		return e
+	}
+	if dir, e := os.Open(filepath.Dir(b.path)); e == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return nil
 }
 
 func (b *Bus) startSweeper() {
@@ -216,17 +254,10 @@ func (b *Bus) Put(name string, msg Msg) error {
 		return ErrClosed
 	}
 	bx := b.boxLocked(name)
-	if msg.ID != "" {
-		for _, existing := range bx.q {
-			if existing.ID == msg.ID {
-				return nil
-			}
-		}
-		for _, existing := range b.inflight {
-			if existing.Msg.Name == name && existing.Msg.ID == msg.ID {
-				return nil
-			}
-		}
+	// Idempotent retry: an identical id already queued or leased is the same
+	// message, not a new one.
+	if b.indexedLocked(name, msg.ID) {
+		return nil
 	}
 	if len(bx.waiters) > 0 {
 		w := bx.waiters[0]
@@ -239,10 +270,17 @@ func (b *Bus) Put(name string, msg Msg) error {
 		return ErrDropped
 	}
 	bx.q = append(bx.q, msg)
-	return b.persistLocked()
+	b.indexAddLocked(msg)
+	if err := b.persistLocked(); err != nil {
+		bx.q = bx.q[:len(bx.q)-1]
+		b.indexDelLocked(msg)
+		return err
+	}
+	return nil
 }
 
-// Reserve claims a message with an at-least-once visibility lease.
+// Reserve claims a message with an at-least-once visibility lease, waiting
+// until one is available or ctx is done.
 func (b *Bus) Reserve(ctx context.Context, name string, lease time.Duration) (Delivery, error) {
 	if name == "" {
 		return Delivery{}, ErrBadName
@@ -250,22 +288,36 @@ func (b *Bus) Reserve(ctx context.Context, name string, lease time.Duration) (De
 	if lease <= 0 {
 		lease = time.Minute
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.closed {
-		return Delivery{}, ErrClosed
+	msg, err := b.Take(ctx, name)
+	if err != nil {
+		return Delivery{}, err
 	}
-	b.requeueExpiredLocked(time.Now())
-	bx := b.boxes[name]
-	if bx == nil || len(bx.q) == 0 {
-		return Delivery{}, ErrEmpty
+	d, err := b.Hold(msg, lease)
+	if err != nil {
+		// Nothing has been handed out yet, so put it back where it was.
+		_ = b.Requeue(msg)
+		return Delivery{}, err
 	}
-	m := bx.q[0]
-	bx.q = bx.q[1:]
-	d := Delivery{ID: newID(), Msg: m, Expires: time.Now().Add(lease)}
-	b.inflight[d.ID] = d
-	if e := b.persistLocked(); e != nil {
-		return Delivery{}, e
+	return d, nil
+}
+
+// TryReserve is Reserve without waiting; it returns ErrEmpty when the mailbox
+// has nothing queued.
+func (b *Bus) TryReserve(name string, lease time.Duration) (Delivery, error) {
+	if name == "" {
+		return Delivery{}, ErrBadName
+	}
+	if lease <= 0 {
+		lease = time.Minute
+	}
+	msg, err := b.TryTake(name)
+	if err != nil {
+		return Delivery{}, err
+	}
+	d, err := b.Hold(msg, lease)
+	if err != nil {
+		_ = b.Requeue(msg)
+		return Delivery{}, err
 	}
 	return d, nil
 }
@@ -286,8 +338,10 @@ func (b *Bus) Hold(msg Msg, lease time.Duration) (Delivery, error) {
 	}
 	d := Delivery{ID: newID(), Msg: msg, Expires: time.Now().Add(lease)}
 	b.inflight[d.ID] = d
+	b.indexAddLocked(msg)
 	if e := b.persistLocked(); e != nil {
 		delete(b.inflight, d.ID)
+		b.indexDelLocked(msg)
 		return Delivery{}, e
 	}
 	return d, nil
@@ -296,10 +350,12 @@ func (b *Bus) Hold(msg Msg, lease time.Duration) (Delivery, error) {
 func (b *Bus) Ack(id string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if _, ok := b.inflight[id]; !ok {
+	d, ok := b.inflight[id]
+	if !ok {
 		return ErrNotFound
 	}
 	delete(b.inflight, id)
+	b.indexDelLocked(d.Msg)
 	return b.persistLocked()
 }
 
@@ -311,6 +367,7 @@ func (b *Bus) Nack(id string) error {
 		return ErrNotFound
 	}
 	delete(b.inflight, id)
+	b.indexDelLocked(d.Msg)
 	b.deliverLocked(d.Msg)
 	return b.persistLocked()
 }
@@ -340,6 +397,7 @@ func (b *Bus) deliverLocked(msg Msg) {
 		return
 	}
 	bx.q = append([]Msg{msg}, bx.q...)
+	b.indexAddLocked(msg)
 }
 
 // ExpireLeases requeues reserved messages whose visibility lease has elapsed.
@@ -359,11 +417,43 @@ func (b *Bus) requeueExpiredLocked(now time.Time) bool {
 	for id, d := range b.inflight {
 		if now.After(d.Expires) {
 			delete(b.inflight, id)
+			b.indexDelLocked(d.Msg)
 			b.deliverLocked(d.Msg)
 			changed = true
 		}
 	}
 	return changed
+}
+
+func dedupKey(name, id string) string { return name + "\x00" + id }
+
+// indexAddLocked records that a copy of msg is queued or leased. Messages
+// handed straight to a waiter are not indexed: they have already left the bus.
+func (b *Bus) indexAddLocked(msg Msg) {
+	if msg.ID == "" || msg.Name == "" {
+		return
+	}
+	b.dedup[dedupKey(msg.Name, msg.ID)]++
+}
+
+func (b *Bus) indexDelLocked(msg Msg) {
+	if msg.ID == "" || msg.Name == "" {
+		return
+	}
+	k := dedupKey(msg.Name, msg.ID)
+	if n := b.dedup[k]; n > 1 {
+		b.dedup[k] = n - 1
+	} else {
+		delete(b.dedup, k)
+	}
+}
+
+func (b *Bus) indexedLocked(name, id string) bool {
+	if id == "" || name == "" {
+		return false
+	}
+	_, ok := b.dedup[dedupKey(name, id)]
+	return ok
 }
 
 func newID() string {
@@ -412,8 +502,10 @@ func (b *Bus) TryTake(name string) (Msg, error) {
 	}
 	msg := bx.q[0]
 	bx.q = bx.q[1:]
+	b.indexDelLocked(msg)
 	if err := b.persistLocked(); err != nil {
 		bx.q = append([]Msg{msg}, bx.q...)
+		b.indexAddLocked(msg)
 		return Msg{}, err
 	}
 	return msg, nil
@@ -436,6 +528,14 @@ func (b *Bus) Pub(topic string, msg Msg) error {
 	defer b.mu.Unlock()
 	if b.closed {
 		return ErrClosed
+	}
+	if _, seen := b.last[topic]; !seen && len(b.last) >= MaxCachedTopics {
+		// Evict an arbitrary entry: the cache is a convenience for late
+		// subscribers, not a retention guarantee.
+		for k := range b.last {
+			delete(b.last, k)
+			break
+		}
 	}
 	b.last[topic] = msg
 	for _, s := range b.subs {
@@ -481,6 +581,13 @@ func (b *Bus) Sub(prefix string) (<-chan Msg, func(), error) {
 }
 
 // Depth returns queued messages in a mailbox.
+// Inflight reports how many deliveries are currently leased.
+func (b *Bus) Inflight() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.inflight)
+}
+
 func (b *Bus) Depth(name string) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -502,8 +609,10 @@ func (b *Bus) takeChan(name string) (chan Msg, error) {
 	if len(bx.q) > 0 {
 		msg := bx.q[0]
 		bx.q = bx.q[1:]
+		b.indexDelLocked(msg)
 		if err := b.persistLocked(); err != nil {
 			bx.q = append([]Msg{msg}, bx.q...)
+			b.indexAddLocked(msg)
 			return nil, err
 		}
 		ch := make(chan Msg, 1)
@@ -535,6 +644,7 @@ func (b *Bus) cancelWaiter(name string, ch chan Msg) {
 		if ok {
 			// Message arrived as we cancelled: put it back at the front.
 			bx.q = append([]Msg{msg}, bx.q...)
+			b.indexAddLocked(msg)
 			_ = b.persistLocked()
 		}
 	default:
