@@ -92,7 +92,11 @@ function _M.connect(listen, name)
   if not ok then
     return nil, err
   end
-  local self = setmetatable({ sock = sock, name = name or "openresty" }, mt)
+  -- Correlation ids double as mailbox message ids, so they must be unique
+  -- across clients: a per-connection counter alone would let two workers
+  -- deduplicate each other's requests.
+  local prefix = string.format("%08x%08x", math.random(0, 0xffffffff), ngx.now() * 1000 % 0xffffffff)
+  local self = setmetatable({ sock = sock, name = name or "openresty", prefix = prefix, seq = 0 }, mt)
   local f, herr = self:hello(self.name)
   if not f then
     sock:close()
@@ -121,12 +125,38 @@ function _M:sub(prefix)
   return self:rpc({ op = "sub", name = prefix or "", from = self.name })
 end
 
-function _M:recv()
-  return read_frame(self.sock)
-end
-
 function _M:ping()
   return self:rpc({ op = "ping" })
+end
+
+function _M:ready(service)
+  return self:rpc({ op = "ready", name = service, from = self.name })
+end
+
+function _M:next_id()
+  self.seq = self.seq + 1
+  return self.prefix .. "-" .. self.seq
+end
+
+-- req requires a correlation id; the hub rejects the frame without one.
+function _M:req(service, text, id)
+  return self:rpc({ op = "req", name = service, from = self.name, text = text or "", id = id or self:next_id() })
+end
+
+function _M:rep(id, text, name)
+  return self:rpc({ op = "rep", id = id, name = name or "", from = self.name, text = text or "" })
+end
+
+function _M:reserve(mailbox, lease)
+  return self:rpc({ op = "reserve", name = mailbox, from = self.name, lease = lease or 60 })
+end
+
+function _M:ack(delivery)
+  return self:rpc({ op = "ack", delivery = delivery })
+end
+
+function _M:nack(delivery)
+  return self:rpc({ op = "nack", delivery = delivery })
 end
 
 function _M:rpc(obj)
@@ -134,7 +164,7 @@ function _M:rpc(obj)
   if not ok then
     return nil, err
   end
-  local f, rerr = read_frame(self.sock)
+  local f, rerr = self:recv()
   if not f then
     return nil, rerr
   end
@@ -142,6 +172,20 @@ function _M:rpc(obj)
     return nil, f.error or "zmqcat error"
   end
   return f
+end
+
+function _M:recv()
+  while true do
+    local f, err = read_frame(self.sock)
+    if not f then
+      return nil, err
+    end
+    if f.op == "ping" then
+      write_frame(self.sock, { op = "pong", id = f.id or "" })
+    else
+      return f
+    end
+  end
 end
 
 function _M:close()

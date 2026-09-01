@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import socket
 import struct
 from typing import Any
@@ -43,7 +44,16 @@ class Client:
             host, port = address.rsplit(":", 1)
             self.sock = socket.create_connection((host, int(port)))
         self.name = name
+        # Correlation ids double as mailbox message ids, so they must be
+        # unique across clients, not just within one.
+        self._prefix = secrets.token_hex(8)
+        self._seq = 0
+        self._desync = False
         self.hello(name)
+
+    def _next_id(self) -> str:
+        self._seq += 1
+        return f"{self._prefix}-{self._seq}"
 
     def close(self) -> None:
         self.sock.close()
@@ -64,10 +74,51 @@ class Client:
         return self._rpc({"op": "sub", "name": prefix, "from": self.name})
 
     def recv(self) -> dict[str, Any]:
-        return self._read()
+        return self._read_skip_ping()
 
     def ping(self) -> dict[str, Any]:
         return self._rpc({"op": "ping"})
+
+    def ready(self, service: str) -> dict[str, Any]:
+        return self._rpc({"op": "ready", "name": service, "from": self.name})
+
+    def req(self, service: str, text: str = "", body: bytes | None = None, timeout: float = 1.0, attempts: int = 3) -> dict[str, Any]:
+        frame = self._payload("req", service, text, body)
+        frame.setdefault("id", self._next_id())
+        last: Exception | None = None
+        for _ in range(max(1, attempts)):
+            try:
+                self.sock.settimeout(timeout)
+                out = self._rpc(frame)
+                self.sock.settimeout(None)
+                return out
+            except socket.timeout as e:
+                last = e
+                self.sock.settimeout(None)
+                # A read cut short part way through a frame leaves the rest of
+                # it queued; nothing after that can be parsed. The hub keeps
+                # the request pending, so reconnect and retry with a new client.
+                if self._desync:
+                    break
+            except Exception as e:
+                last = e
+                self.sock.settimeout(None)
+                break
+        raise RuntimeError(f"request abandoned after {attempts} attempts: {last}")
+
+    def rep(self, corr_id: str, text: str = "", name: str = "", body: bytes | None = None) -> dict[str, Any]:
+        f = self._payload("rep", name, text, body)
+        f["id"] = corr_id
+        return self._rpc(f)
+
+    def reserve(self, mailbox: str, lease: int = 60) -> dict[str, Any]:
+        return self._rpc({"op": "reserve", "name": mailbox, "from": self.name, "lease": lease})
+
+    def ack(self, delivery: str) -> dict[str, Any]:
+        return self._rpc({"op": "ack", "delivery": delivery})
+
+    def nack(self, delivery: str) -> dict[str, Any]:
+        return self._rpc({"op": "nack", "delivery": delivery})
 
     def _payload(self, op: str, name: str, text: str, body: bytes | None) -> dict[str, Any]:
         f: dict[str, Any] = {"op": op, "name": name, "from": self.name, "text": text}
@@ -78,31 +129,70 @@ class Client:
         return f
 
     def _rpc(self, f: dict[str, Any]) -> dict[str, Any]:
+        self._guard()
         self._write(f)
-        out = self._read()
+        out = self._read_skip_ping()
         if out.get("op") == "err":
             raise RuntimeError(out.get("error") or "zmqcat error")
         return out
+
+    def _read_skip_ping(self) -> dict[str, Any]:
+        while True:
+            out = self._read()
+            if out.get("op") == "ping":
+                self._write({"op": "pong", "id": out.get("id", "")})
+                continue
+            return out
 
     def _write(self, f: dict[str, Any]) -> None:
         raw = json.dumps(f).encode()
         self.sock.sendall(MAGIC + struct.pack(">I", len(raw)) + raw)
 
+    def _guard(self) -> None:
+        if self._desync:
+            raise RuntimeError("zmqcat: session desynchronized, reconnect required")
+
     def _read(self) -> dict[str, Any]:
-        hdr = _readn(self.sock, 8)
+        try:
+            hdr = _readn(self.sock, 8)
+        except _Partial as e:
+            self._desync = True
+            raise e.cause
         if hdr[:4] != MAGIC:
+            self._desync = True
             raise RuntimeError(f"bad magic {hdr[:4]!r}")
         (n,) = struct.unpack(">I", hdr[4:])
-        raw = _readn(self.sock, n)
+        try:
+            raw = _readn(self.sock, n)
+        except (_Partial, socket.timeout) as e:
+            # The frame body is still on the wire; the stream cannot resync.
+            self._desync = True
+            raise e.cause if isinstance(e, _Partial) else e
         return json.loads(raw)
+
+
+class _Partial(Exception):
+    """A read stopped after consuming some, but not all, of a frame."""
+
+    def __init__(self, cause: BaseException):
+        super().__init__(str(cause))
+        self.cause = cause
 
 
 def _readn(sock: socket.socket, n: int) -> bytes:
     buf = bytearray()
     while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
+        try:
+            chunk = sock.recv(n - len(buf))
+        except BaseException as e:
+            if buf:
+                raise _Partial(e) from e
+            raise
         if not chunk:
-            raise EOFError("zmqcat socket closed")
+            e = EOFError("zmqcat socket closed")
+            if buf:
+                raise _Partial(e) from e
+            raise e
         buf.extend(chunk)
     return bytes(buf)
 
@@ -125,5 +215,9 @@ if __name__ == "__main__":
         c.sub(sys.argv[2] if len(sys.argv) > 2 else "")
         while True:
             print(c.recv())
+    elif op == "ready":
+        print(c.ready(sys.argv[2]))
+    elif op == "req":
+        print(c.req(sys.argv[2], " ".join(sys.argv[3:])))
     else:
-        raise SystemExit("put|take|pub|sub")
+        raise SystemExit("put|take|pub|sub|ready|req")

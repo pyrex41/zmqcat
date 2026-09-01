@@ -14,10 +14,12 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/pyrex41/zmqcat/internal/addr"
 	"github.com/pyrex41/zmqcat/internal/hub"
 	"github.com/pyrex41/zmqcat/internal/mailbox"
+	"github.com/pyrex41/zmqcat/internal/wire"
 	"github.com/tailscale/tailcat"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -29,6 +31,13 @@ const MailboxPort uint16 = 7
 
 // Config is Serve/Join options.
 type Config struct {
+	// MailboxPath enables durable at-least-once mailboxes on the serving node.
+	// Empty keeps the historical in-memory behavior.
+	MailboxPath string
+	// Heartbeat is the session liveness interval. Zero means 5s; negative disables.
+	Heartbeat time.Duration
+	// Trace logs each ZMQC frame (session, direction, op/id/name).
+	Trace bool
 	// Listen is the local sidecar address (unix:// or tcp://). Empty uses
 	// unix:///tmp/zmqcat-<uid>.sock.
 	Listen string
@@ -62,7 +71,7 @@ type Node struct {
 	closers []io.Closer
 }
 
-func (n *Node) Token() string { return string(n.token) }
+func (n *Node) Token() string  { return string(n.token) }
 func (n *Node) Listen() string { return n.listen }
 
 func (n *Node) Close() error {
@@ -189,9 +198,32 @@ func newLocal(cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	h := hub.New(mailbox.New())
+	var bus *mailbox.Bus
+	if cfg.MailboxPath != "" {
+		var err error
+		bus, err = mailbox.OpenPersistent(cfg.MailboxPath, mailbox.DefaultMaxQueue, mailbox.DefaultMaxBody)
+		if err != nil {
+			_ = ln.Close()
+			return nil, fmt.Errorf("mailbox storage: %w", err)
+		}
+	} else {
+		bus = mailbox.New()
+	}
+	h := hub.New(bus)
 	if cfg.Logf != nil {
 		h.Logf = cfg.Logf
+	}
+	switch {
+	case cfg.Heartbeat < 0:
+		h.Heartbeat = 0
+	case cfg.Heartbeat > 0:
+		h.Heartbeat = cfg.Heartbeat
+	}
+	if cfg.Trace {
+		logf := logfOr(cfg.Logf)
+		h.Trace = func(session, dir string, f wire.Frame) {
+			logf("zmqcat %s %s op=%s id=%s name=%s", session, dir, f.Op, f.ID, f.Name)
+		}
 	}
 	n := &Node{
 		cfg:    cfg,
