@@ -23,6 +23,9 @@ One side `serve`s and prints a token. Everyone else `join`s with that token. Loc
 go install github.com/pyrex41/zmqcat/cmd/zmqcat@latest
 ```
 
+Or with Nix — `nix run github:pyrex41/zmqcat -- serve --local` to try it, or
+add the flake for the `services.zmqcat` module ([below](#run-it-as-a-service)).
+
 ## Just works
 
 Hub (prints a `tc…` token):
@@ -60,7 +63,7 @@ zmqcat req echo '{"hello":true}'
 
 Default sidecar: `unix:///tmp/zmqcat-<uid>.sock`. Override with `--listen tcp://127.0.0.1:5555` or `ZMQCAT_LISTEN`.
 
-## Install with Nix
+## Run it as a service
 
 ```nix
 {
